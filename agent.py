@@ -21,6 +21,8 @@ from tools import (
     validate_plan,
 )
 
+FALLBACK_SOURCE = "curated fallback"
+
 
 # System prompt for final plan generation
 PLANNER_PROMPT = """You are a friendly, knowledgeable local guide helping someone plan their perfect Saturday.
@@ -90,14 +92,18 @@ def run_agent(user_input: dict, on_step=None):
         prefs["mood"], prefs["available_hours"]
     )
     if activities:
+        activity_source = activities[0].get("_data_source", FALLBACK_SOURCE)
         log("get_activities", "done",
-            f"Found {len(activities)} matching activities",
-            data=[{"name": a["name"], "score": a["_relevance_score"]} for a in activities])
+            f"Found {len(activities)} matching activities from {activity_source}",
+            data=[{"name": a["name"], "score": a["_relevance_score"],
+                   "source": a.get("_data_source", FALLBACK_SOURCE)}
+                  for a in activities])
     else:
         log("get_activities", "warning", "No perfect matches — using broader suggestions")
         # fallback: try without mood filter
         from mock_data import DEFAULT_ACTIVITIES
-        activities = DEFAULT_ACTIVITIES[:3]
+        activities = [{**activity, "_data_source": FALLBACK_SOURCE}
+                      for activity in DEFAULT_ACTIVITIES[:3]]
 
     # ---- Step 3: Find food spots ----
     log("get_food_spots", "running", "Finding food options...")
@@ -107,26 +113,58 @@ def run_agent(user_input: dict, on_step=None):
     )
     if food:
         dietary_note = "vegetarian " if any("veg" in c for c in prefs["constraints"]) else ""
+        food_source = food[0].get("_data_source", FALLBACK_SOURCE)
         log("get_food_spots", "done",
-            f"Found {len(food)} {dietary_note}food spots within budget",
-            data=[{"name": f["name"], "cost": f["cost_per_person"]} for f in food])
+            f"Found {len(food)} {dietary_note}food spots from {food_source} within budget",
+            data=[{"name": f["name"], "cost": f["cost_per_person"],
+                   "source": f.get("_data_source", FALLBACK_SOURCE)}
+                  for f in food])
     else:
         log("get_food_spots", "warning", "Limited food options for your constraints")
         from mock_data import DEFAULT_FOOD
-        food = DEFAULT_FOOD
+        food = [{**spot, "_data_source": FALLBACK_SOURCE}
+            for spot in DEFAULT_FOOD]
 
-    # ---- Step 4: Estimate costs ----
-    log("estimate_cost", "running", "Calculating costs...")
-    cost = estimate_cost(activities[:3], food[:2])  # estimate for top picks
+    # ---- Step 4: Select feasible itinerary & Estimate costs ----
+    log("estimate_cost", "running", "Selecting best-fit items and calculating costs...")
+    
+    # Intelligently select activities & food spots that fit the user's available time and budget
+    selected_acts = []
+    selected_food = []
+    remaining_time = prefs["available_hours"]
+    
+    # Priority: 1 food spot if time >= 2 hours
+    if food and remaining_time >= 2.0:
+        selected_food.append(food[0])
+        remaining_time -= 1.0  # reserve ~1 hour for food
+        
+    for act in activities:
+        act_dur = act.get("duration_hours", 1.5)
+        if act_dur <= remaining_time:
+            selected_acts.append(act)
+            remaining_time -= act_dur
+            if len(selected_acts) >= 3:
+                break
+                
+    # If no activity fit in remaining time, at least pick the shortest top-ranked activity
+    if not selected_acts and activities:
+        selected_acts.append(min(activities, key=lambda x: x.get("duration_hours", 2.0)))
+        
+    # If plenty of time remaining, add a second food spot (e.g. snack/dinner)
+    if len(food) > 1 and remaining_time >= 1.5:
+        selected_food.append(food[1])
+        remaining_time -= 1.0
+
+    cost = estimate_cost(selected_acts, selected_food)
     budget_pct = round(cost["total_estimated"] / prefs["budget"] * 100) if prefs["budget"] > 0 else 0
     log("estimate_cost", "done",
-        f"Estimated total: ₹{cost['total_estimated']} ({budget_pct}% of ₹{prefs['budget']} budget)",
+        f"Estimated total: ₹{cost['total_estimated']} ({budget_pct}% of ₹{prefs['budget']} budget for {len(selected_acts)} activities & {len(selected_food)} food spots)",
         data=cost)
 
     # ---- Step 5: Validate plan ----
     log("validate_plan", "running", "Checking against your constraints...")
     validation = validate_plan(
-        activities[:3], food[:2], cost,
+        selected_acts, selected_food, cost,
         prefs["budget"], prefs["constraints"],
         prefs["available_hours"]
     )
@@ -138,17 +176,20 @@ def run_agent(user_input: dict, on_step=None):
             f"Issues found: {'; '.join(validation['issues'])}",
             data=validation)
         # try to adjust — remove most expensive activity
-        if activities and cost["total_estimated"] > prefs["budget"]:
+        if selected_acts and cost["total_estimated"] > prefs["budget"]:
             log("validate_plan", "running", "Adjusting plan to fit budget...")
-            activities_sorted = sorted(activities, key=lambda x: x.get("cost", 0))
-            activities = activities_sorted  # prefer cheaper ones
-            cost = estimate_cost(activities[:3], food[:2])
+            selected_acts = sorted(selected_acts, key=lambda x: x.get("cost", 0))[:max(1, len(selected_acts)-1)]
+            cost = estimate_cost(selected_acts, selected_food)
             validation = validate_plan(
-                activities[:3], food[:2], cost,
+                selected_acts, selected_food, cost,
                 prefs["budget"], prefs["constraints"],
                 prefs["available_hours"]
             )
             log("validate_plan", "done", "Adjusted plan to better fit constraints")
+
+    # Pass the selected feasible candidate items to the final plan generator
+    activities = selected_acts
+    food = selected_food
 
     # ---- Step 6: Generate final plan with LLM ----
     log("generate_final_plan", "running", "Crafting your personalized plan...")
@@ -184,13 +225,7 @@ def _generate_plan_with_llm(prefs, activities, food, cost, validation):
             pass
 
     if not api_key:
-        raise ValueError("No API key found")
-
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
-        system_instruction=PLANNER_PROMPT,
-    )
+        raise ValueError("No Gemini API key found")
 
     context = f"""
 User Preferences:
@@ -202,7 +237,7 @@ User Preferences:
 - Constraints: {', '.join(prefs['constraints']) if prefs['constraints'] else 'none'}
 
 Available Activities (ranked by relevance):
-{json.dumps([{k: v for k, v in a.items() if k != '_relevance_score'} for a in activities[:5]], indent=2)}
+{json.dumps([{k: v for k, v in a.items() if not k.startswith('_')} for a in activities[:5]], indent=2)}
 
 Food Options:
 {json.dumps(food[:4], indent=2)}
@@ -216,15 +251,27 @@ Validation Notes:
 Now create the Saturday plan. Pick the BEST 2-3 activities and 1-2 food spots, not all of them.
 """
 
-    response = model.generate_content(
-        context,
-        generation_config=genai.types.GenerationConfig(
-            temperature=0.7,
-            max_output_tokens=1500,
-        ),
-    )
+    if not genai:
+        raise ValueError("Google Gemini SDK is not installed")
 
-    return response.text
+    genai.configure(api_key=api_key)
+
+    try:
+        model = genai.GenerativeModel(
+            model_name="gemini-flash-latest",
+            system_instruction=PLANNER_PROMPT,
+        )
+        response = model.generate_content(
+            context,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.7,
+                max_output_tokens=3000,
+            ),
+        )
+        if response and response.text:
+            return response.text
+    except Exception as e:
+        raise e
 
 
 def _generate_fallback_plan(prefs, activities, food, cost, validation):
@@ -266,7 +313,7 @@ def _generate_fallback_plan(prefs, activities, food, cost, validation):
         lines.append(f"*Cost: ~₹{top_food[1]['cost_per_person']} per person*\n")
 
     lines.append("---")
-    lines.append(f"### 💰 Budget Summary")
+    lines.append("### 💰 Budget Summary")
     lines.append(f"- Estimated total: **₹{cost['total_estimated']}** of ₹{prefs['budget']} budget")
     if validation["warnings"]:
         lines.append(f"\n⚠️ *Note: {'; '.join(validation['warnings'])}*")
@@ -283,3 +330,61 @@ def _error_result(trace, message):
         "validation": {"is_valid": False, "issues": [message]},
         "preferences": {},
     }
+
+
+def refine_plan(previous_plan: str, feedback: str, prefs: dict) -> str:
+    """
+    Refine the generated plan based on 1-shot user feedback.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        try:
+            import streamlit as st
+            api_key = st.secrets.get("GEMINI_API_KEY", "")
+        except Exception:
+            pass
+
+    if not api_key or not genai:
+        # Fallback if no LLM: append user note to plan
+        return (
+            f"{previous_plan}\n\n"
+            f"---\n"
+            f"🔄 **Refinement Note:** User requested '{feedback}'. "
+            f"Please swap or adjust the relevant slot according to this preference!"
+        )
+
+    prompt = f"""You previously created this Saturday plan for a user in {prefs.get('city', 'their city')}:
+
+{previous_plan}
+
+The user has given this follow-up feedback to tweak the plan:
+"{feedback}"
+
+Update and return the full Saturday plan reflecting their feedback.
+Keep the same friendly, time-blocked format and practical advice.
+Explicitly mention the adjustment made in response to their feedback.
+"""
+
+    genai.configure(api_key=api_key)
+
+    try:
+        model = genai.GenerativeModel(
+            model_name="gemini-flash-latest",
+            system_instruction=PLANNER_PROMPT,
+        )
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.7,
+                max_output_tokens=3000,
+            ),
+        )
+        if response and response.text:
+            return response.text
+    except Exception as e:
+        err_msg = f" ({str(e)[:60]})"
+        return (
+            f"{previous_plan}\n\n"
+            f"---\n"
+            f"🔄 **Refinement Applied:** '{feedback}'{err_msg}."
+        )

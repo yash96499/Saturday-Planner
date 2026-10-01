@@ -5,11 +5,15 @@ Each tool does one specific thing — the agent orchestrates them.
 
 import re
 import json
+import time
 from mock_data import (
     ACTIVITIES, FOOD_SPOTS,
     DEFAULT_ACTIVITIES, DEFAULT_FOOD,
     CITY_ALIASES,
 )
+from live_data import fetch_activities, fetch_food_spots
+
+FALLBACK_SOURCE = "curated fallback"
 
 
 def parse_preferences(raw_input: dict) -> dict:
@@ -82,7 +86,15 @@ def get_activities(city_key: str, interests: list, mood: str,
     Find and rank activities based on user preferences.
     Scores each activity by interest match, mood fit, and time feasibility.
     """
-    activities = ACTIVITIES.get(city_key, DEFAULT_ACTIVITIES)
+    try:
+        activities = fetch_activities(city_key, interests)
+    except (ValueError, RuntimeError, OSError):
+        activities = []
+
+    if not activities:
+        fallback = ACTIVITIES.get(city_key, DEFAULT_ACTIVITIES)
+        activities = [{**activity, "_data_source": FALLBACK_SOURCE}
+                      for activity in fallback]
 
     scored = []
     for activity in activities:
@@ -121,14 +133,42 @@ def get_activities(city_key: str, interests: list, mood: str,
 
 
 def get_food_spots(city_key: str, budget: int, constraints: list,
-                   interests: list = None) -> list:
+                   _interests: list = None) -> list:
     """
     Find food spots matching dietary constraints and budget.
     Budget allocation: ~40% of total budget for food.
     """
-    spots = FOOD_SPOTS.get(city_key, DEFAULT_FOOD)
+    try:
+        time.sleep(2)  # avoid Overpass API rate-limiting after activities query
+        spots = fetch_food_spots(city_key)
+    except (ValueError, RuntimeError, OSError):
+        spots = []
+
+    if not spots:
+        fallback = FOOD_SPOTS.get(city_key, DEFAULT_FOOD)
+        spots = [{**spot, "_data_source": FALLBACK_SOURCE}
+                 for spot in fallback]
     food_budget = budget * 0.4  # rule of thumb
 
+    matching = _filter_food_spots(spots, food_budget, constraints)
+
+    # OSM dietary tags are often incomplete. Prefer a constraint-safe curated
+    # fallback over presenting an unverified venue as vegetarian or vegan.
+    if not matching and any(
+            spot.get("_data_source") == "OpenStreetMap" for spot in spots):
+        fallback = FOOD_SPOTS.get(city_key, DEFAULT_FOOD)
+        fallback = [{**spot, "_data_source": FALLBACK_SOURCE}
+                    for spot in fallback]
+        matching = _filter_food_spots(fallback, food_budget, constraints)
+
+    # sort by rating
+    matching.sort(key=lambda x: x.get("rating", 3.0), reverse=True)
+    return matching[:5]
+
+
+def _filter_food_spots(spots: list, food_budget: float,
+                       constraints: list) -> list:
+    """Apply hard dietary, crowd, and budget constraints to food candidates."""
     matching = []
     for spot in spots:
         # dietary constraint check
@@ -155,10 +195,7 @@ def get_food_spots(city_key: str, budget: int, constraints: list,
         # budget check (per person)
         if spot["cost_per_person"] <= food_budget:
             matching.append(spot)
-
-    # sort by rating
-    matching.sort(key=lambda x: x.get("rating", 3.0), reverse=True)
-    return matching[:5]
+    return matching
 
 
 def estimate_cost(activities: list, food_spots: list) -> dict:

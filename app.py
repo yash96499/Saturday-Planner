@@ -2,7 +2,7 @@ import streamlit as st
 import json
 import time
 
-from agent import run_agent
+from agent import run_agent, refine_plan
 
 # --- Page config ---
 st.set_page_config(
@@ -86,25 +86,21 @@ if submitted:
     )
 
     step_messages = []
-
     def on_step(tool_name, status, detail):
-        """Callback for live trace updates."""
-        icon = {
-            "running": "⏳",
-            "done": "✅",
-            "warning": "⚠️",
-            "error": "❌",
-        }.get(status, "🔧")
-        msg = f"{icon} **{tool_name}** — {detail}"
-        step_messages.append(msg)
+        icon = {"done": "✅", "warning": "⚠️", "error": "❌", "running": "⏳"}.get(
+            status, "🔧"
+        )
         with trace_container:
-            for m in step_messages:
-                st.markdown(m)
-        # small delay so user can see each step
+            st.markdown(f"{icon} **{tool_name}** — {detail}")
         time.sleep(0.3)
 
     # Run the agent
     result = run_agent(user_input, on_step=on_step)
+
+    # Store in session state so follow-ups can refine it
+    st.session_state["plan_result"] = result
+    st.session_state["followup_used"] = False
+    st.session_state["refinement_note"] = None
 
     # Update status
     trace_container.update(
@@ -113,9 +109,46 @@ if submitted:
         expanded=False,
     )
 
+# --- Display result from session state if available ---
+if "plan_result" in st.session_state:
+    result = st.session_state["plan_result"]
+
     # --- Display the plan ---
     st.markdown("---")
     st.markdown(result["plan"])
+
+    # --- 1-Shot Followup / Refinement Box ---
+    st.markdown("### 💬 Want to tweak this plan?")
+    if not st.session_state.get("followup_used", False):
+        refine_col1, refine_col2 = st.columns([4, 1])
+        with refine_col1:
+            tweak_input = st.text_input(
+                "Feedback / Adjustments (1 refinement allowed)",
+                placeholder="e.g. 'Make it more relaxing', 'Swap breakfast for South Indian', 'Keep strictly under ₹500'",
+                label_visibility="collapsed",
+                key="tweak_input_field",
+            )
+        with refine_col2:
+            refine_btn = st.button("🔄 Refine", use_container_width=True)
+
+        if refine_btn:
+            if tweak_input.strip():
+                with st.spinner("🤖 Refining your plan based on your feedback..."):
+                    updated_plan = refine_plan(
+                        previous_plan=result["plan"],
+                        feedback=tweak_input.strip(),
+                        prefs=result.get("preferences", {}),
+                    )
+                    st.session_state["plan_result"]["plan"] = updated_plan
+                    st.session_state["followup_used"] = True
+                    st.session_state["refinement_note"] = tweak_input.strip()
+                    st.rerun()
+            else:
+                st.warning("Please enter your adjustment request first.")
+    else:
+        st.success(
+            f"✨ **Plan refined** with request: *'{st.session_state.get('refinement_note', '')}'* (Max 1 refinement used)"
+        )
 
     # --- Cost summary in sidebar-style expander ---
     if result.get("cost"):
@@ -159,6 +192,6 @@ if submitted:
 st.divider()
 st.caption(
     "Built with Streamlit + Gemini | "
-    "Data is mock but uses real place names | "
+    "Live places from OpenStreetMap with curated fallback | "
     "[GitHub](https://github.com)"
 )
